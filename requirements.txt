@@ -1,0 +1,11 @@
+requests
+beautifulsoup4
+lxml
+python-dotenv
+streamlit
+chromadb
+langchain
+langchain-core
+langchain-community
+langchain-chroma
+langchain-google-genai
