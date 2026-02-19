@@ -68,6 +68,9 @@ RS-INFOHUB-RAG
 # ვირტუალური გარემოს შექმნა
 python -m venv .venv
 
+# PowerShell Execution Policy (Windows — საჭიროა ერთჯერადად)
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
 # გააქტიურება (Windows)
 .\.venv\Scripts\activate
 
