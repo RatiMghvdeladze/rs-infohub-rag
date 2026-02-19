@@ -227,7 +227,16 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+        # Replay stored sources for assistant messages
+        if msg["role"] == "assistant" and msg.get("sources"):
+            with st.expander("📄 წყაროები", expanded=False):
+                for src_url, src_title in msg["sources"]:
+                    if src_title:
+                        st.markdown(f"• **{src_title}**  \n  {src_url}")
+                    else:
+                        st.write(f"• {src_url}")
 
 if query := st.chat_input("დასვით კითხვა..."):
     st.chat_message("user").write(query)
@@ -270,25 +279,21 @@ if query := st.chat_input("დასვით კითხვა..."):
         # ------------------------------------------------------------------
         # Sources section
         # ------------------------------------------------------------------
-        with st.expander("📄 წყაროები", expanded=False): # Collapsed by default to reduce clutter
-            if result.best_vector_score >= threshold and result.docs:
-                sources_shown = []
-                for d in result.docs:
-                    src = d.metadata.get("source", "")
-                    title = d.metadata.get("title", "")
-                    if src and src not in [s[0] for s in sources_shown]:
-                        sources_shown.append((src, title))
+        sources_list = []
+        if result.best_vector_score >= threshold and result.docs:
+            for d in result.docs:
+                src = d.metadata.get("source", "")
+                title = d.metadata.get("title", "")
+                if src and src not in [s[0] for s in sources_list]:
+                    sources_list.append((src, title))
 
-                if sources_shown:
-                    for src_url, src_title in sources_shown:
-                        if src_title:
-                            st.markdown(f"• **{src_title}**  \n  {src_url}")
-                        else:
-                            st.write(f"• {src_url}")
-                else:
-                    st.write("ამ შეკითხვაზე შესაბამისი წყაროები ვერ მოიძებნა.")
-            else:
-                st.write("შესაბამისობა (score) დაბალია, ამიტომ წყაროები არ გამოჩნდა ამ პასუხისთვის.")
+        if sources_list:
+            with st.expander("📄 წყაროები", expanded=False):
+                for src_url, src_title in sources_list:
+                    if src_title:
+                        st.markdown(f"• **{src_title}**  \n  {src_url}")
+                    else:
+                        st.write(f"• {src_url}")
 
         # ------------------------------------------------------------------
         # Debug section
@@ -322,4 +327,4 @@ if query := st.chat_input("დასვით კითხვა..."):
                     st.code(preview)
                     st.divider()
 
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        st.session_state.messages.append({"role": "assistant", "content": full_response, "sources": sources_list})
