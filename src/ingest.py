@@ -174,8 +174,17 @@ def main():
     chunks = splitter.split_documents(langchain_docs)
     print(f"📦 chunks რაოდენობა: {len(chunks)}")
 
-    # Save chunks for BM25 hybrid search
-    export_chunks_jsonl(chunks, CHUNKS_FILE)
+    # Create BM25 and save it
+    print("🧠 BM25 ინდექსის აგება და შენახვა...")
+    from langchain_community.retrievers import BM25Retriever
+    import dill
+
+    bm25_retriever = BM25Retriever.from_documents(chunks)
+    bm25_retriever.k = 10
+    
+    with open("data/bm25_retriever.pkl", "wb") as f:
+        dill.dump(bm25_retriever, f)
+    print("✅ BM25 ინდექსი შენახულია: data/bm25_retriever.pkl")
 
     embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 

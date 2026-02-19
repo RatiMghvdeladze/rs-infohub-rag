@@ -34,8 +34,8 @@ st.set_page_config(page_title="InfoHub AI", page_icon="🇬🇪")
 # -----------------------------
 # Defaults
 # -----------------------------
-DEFAULT_K = 5
-DEFAULT_THRESHOLD = 0.45
+DEFAULT_K = 10
+DEFAULT_THRESHOLD = 0.25
 MAX_HISTORY_TURNS = 4  # how many past Q&A pairs to include in prompt
 
 SOURCE_FOOTER = (
@@ -131,9 +131,9 @@ def build_conversation_context(messages: list, max_turns: int = MAX_HISTORY_TURN
     return "წინა დიალოგი:\n" + "\n\n".join(turns)
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Load resources (cached)
-# -----------------------------
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def load_resources():
     """Load vectorstore, BM25 retriever, and LLM once."""
@@ -143,32 +143,43 @@ def load_resources():
     embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
     vectorstore = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
 
-    # BM25 from chunks.jsonl
-    bm25_docs = load_chunks_from_file(Path(CHUNKS_FILE))
-    bm25_retriever = None
-    if bm25_docs:
-        bm25_retriever = BM25Retriever.from_documents(bm25_docs)
-        bm25_retriever.k = 10  # retrieve more, RRF will re-rank
+    # Try loading pickled BM25 first (much faster)
+    from retriever import load_bm25_retriever
+    bm25_retriever = load_bm25_retriever(Path("data/bm25_retriever.pkl"))
+    
+    # Fallback to building from chunks.jsonl if pickle fails
+    bm25_count = 0
+    if bm25_retriever is None:
+        bm25_docs = load_chunks_from_file(Path(CHUNKS_FILE))
+        if bm25_docs:
+            bm25_retriever = BM25Retriever.from_documents(bm25_docs)
+            bm25_retriever.k = 10
+            bm25_count = len(bm25_docs)
+    else:
+        # We don't know the count easily from pickle without accessing internal list, 
+         # but we can just say "Loaded from Pickle"
+        bm25_count = -1 
 
     using_hybrid = bm25_retriever is not None
 
-    # Upgraded LLM: gemini-2.5-flash for much better reasoning
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    # gemini-2.0-flash: fast, no thinking delays, ideal for RAG
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
 
-    return vectorstore, bm25_retriever, llm, using_hybrid, len(bm25_docs)
+    return vectorstore, bm25_retriever, llm, using_hybrid, bm25_count
 
 
 def generate_answer(question: str, context: str, conversation_history: str, llm) -> str:
     """Generate an answer using the LLM with full context."""
     prompt = f"""შენ ხარ საქართველოს შემოსავლების სამსახურის ინტელექტუალური ასისტენტი.
-პასუხი გასცე მხოლოდ ქვემოთ მოცემული კონტექსტის საფუძველზე.
+შენი მიზანია მომხმარებელს დაეხმარო მაქსიმალურად. პასუხი გასცე ქვემოთ მოცემული კონტექსტის საფუძველზე.
 
 წესები:
 1. უპასუხე ქართულ ენაზე.
-2. თუ პასუხი კონტექსტში არ არის, თქვი: "ამ კითხვაზე ინფორმაცია ხელმისაწვდომ დოკუმენტებში ვერ მოიძებნა. გთხოვთ, დაუკავშირდით შემოსავლების სამსახურს დეტალური ინფორმაციისთვის."
+2. ყურადღებით წაიკითხე მთლიანი კონტექსტი. თუ კონტექსტში არის რაიმე დაკავშირებული ინფორმაცია — თუნდაც ნაწილობრივი ან არაპირდაპირი — გამოიყენე და აუხსენი მომხმარებელს. მხოლოდ იმ შემთხვევაში თქვი "ვერ მოიძებნა" თუ კონტექსტში ნამდვილად არაფერია კითხვასთან დაკავშირებული.
 3. იყავი ზუსტი და კონკრეტული — მიუთითე კანონის მუხლები, ვადები, განაკვეთები თუ კონტექსტში მოცემულია.
 4. პასუხი დააფორმატე გასაგებად: გამოიყენე ჩამონათვალი ან ნუმერაცია საჭიროებისამებრ.
-5. ყოველთვის დაასრულე პასუხი ზუსტად ამ ფრაზით:
+5. თუ კონტექსტში პასუხი ნაწილობრივ არის, მაინც უპასუხე ნაწილობრივად და აღნიშნე რომ სრული ინფორმაციისთვის შემოსავლების სამსახურთან დაკავშირება სჯობს.
+6. ყოველთვის დაასრულე პასუხი ზუსტად ამ ფრაზით:
    "{SOURCE_FOOTER}"
 
 {conversation_history}
@@ -182,14 +193,14 @@ def generate_answer(question: str, context: str, conversation_history: str, llm)
     return response.content if hasattr(response, "content") else str(response)
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # UI
-# -----------------------------
+# ---------------------------------------------------------------------------
 st.title("InfoHub AI Agent 🏛️")
 
 st.sidebar.header("⚙️ პარამეტრები")
 debug_mode = st.sidebar.checkbox("Debug რეჟიმი", value=False)
-k = st.sidebar.slider("Top-K დოკუმენტი (retrieval)", min_value=1, max_value=10, value=DEFAULT_K)
+k = st.sidebar.slider("Top-K დოკუმენტი (retrieval)", min_value=1, max_value=20, value=DEFAULT_K) # Increased max K
 threshold = st.sidebar.slider(
     "Threshold (წყაროების ჩვენება)",
     min_value=0.10, max_value=0.95, value=DEFAULT_THRESHOLD, step=0.01,
@@ -204,7 +215,10 @@ if not vectorstore:
 retriever_label = "HYBRID (BM25 + Vector + RRF)" if using_hybrid else "Vector-only"
 st.sidebar.caption(f"Retriever: {retriever_label}")
 if using_hybrid:
-    st.sidebar.caption(f"BM25 chunks loaded: {bm25_count:,}")
+    if bm25_count == -1:
+        st.sidebar.caption("BM25 Index: Loaded from Pickle ⚡")
+    else:
+        st.sidebar.caption(f"BM25 chunks loaded: {bm25_count:,}")
 else:
     st.sidebar.caption("BM25 chunks not found → run `python src/ingest.py`")
 
@@ -228,12 +242,13 @@ if query := st.chat_input("დასვით კითხვა..."):
             st.session_state.messages.append({"role": "assistant", "content": response})
             st.stop()
 
-        # === Single unified retrieval call ===
+        # === Single unified retrieval call (with Query Expansion) ===
         with st.spinner("🔍 ძიება მიმდინარეობს..."):
             result = retrieve(
                 question=query,
                 vectorstore=vectorstore,
                 bm25_retriever=bm25_retriever,
+                llm=llm, # Pass LLM for Query Expansion
                 k=k,
             )
 
@@ -242,16 +257,20 @@ if query := st.chat_input("დასვით კითხვა..."):
 
         # Generate answer
         context_text = format_docs(result.docs)
+        
+        if debug_mode:
+            st.info(f"Retrieved {len(result.docs)} unique documents.")
 
+        # Generate answer (reliable invoke, no freezing)
         with st.spinner("💭 პასუხის გენერირება..."):
-            response = generate_answer(query, context_text, conv_history, llm)
+            full_response = generate_answer(query, context_text, conv_history, llm)
 
-        st.write(response)
+        st.markdown(full_response)
 
         # ------------------------------------------------------------------
         # Sources section
         # ------------------------------------------------------------------
-        with st.expander("📄 წყაროები", expanded=True):
+        with st.expander("📄 წყაროები", expanded=False): # Collapsed by default to reduce clutter
             if result.best_vector_score >= threshold and result.docs:
                 sources_shown = []
                 for d in result.docs:
@@ -303,4 +322,4 @@ if query := st.chat_input("დასვით კითხვა..."):
                     st.code(preview)
                     st.divider()
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.session_state.messages.append({"role": "assistant", "content": full_response})

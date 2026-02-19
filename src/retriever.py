@@ -89,6 +89,42 @@ def load_chunks_from_file(path: Path) -> list[Document]:
     return docs
 
 
+def load_bm25_retriever(path: Path) -> BM25Retriever | None:
+    """Load pre-built BM25 retriever from pickle."""
+    if not path.exists():
+        return None
+    try:
+        import dill
+        with open(path, "rb") as f:
+            return dill.load(f)
+    except Exception as e:
+        print(f"BM25 Save Load Error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Query Expansion
+# ---------------------------------------------------------------------------
+def generate_multi_queries(llm, original_query: str) -> list[str]:
+    """Generate 3 variations of the original query for better recall."""
+    prompt = (
+        "You are an AI language model assistant. Your task is to generate 3 different versions "
+        "of the given user question to retrieve relevant documents from a vector database. "
+        "By generating multiple perspectives on the user question, your goal is to help "
+        "the user overcome some of the limitations of the distance-based similarity search. "
+        "Provide these alternative questions separated by newlines. "
+        "Original question: " + original_query
+    )
+    
+    try:
+        response = llm.invoke(prompt)
+        content = response.content if hasattr(response, "content") else str(response)
+        questions = [q.strip() for q in content.split("\n") if q.strip()]
+        return [original_query] + questions[:3]  # original + up to 3 variations
+    except Exception:
+        return [original_query]
+
+
 # ---------------------------------------------------------------------------
 # Main retrieval function
 # ---------------------------------------------------------------------------
@@ -96,39 +132,66 @@ def retrieve(
     question: str,
     vectorstore: Chroma,
     bm25_retriever: BM25Retriever | None,
+    llm=None, # Optional LLM for query expansion
     k: int = 5,
 ) -> RetrievalResult:
     """
-    Single entry point for retrieval.
+    Single entry point for retrieval with optional Multi-Query Expansion.
 
-    1. BM25 top-k + Vector top-k (with scores)
-    2. RRF fusion across both lists
-    3. Return top-k results + metadata
+    1. Generate query variations (if llm provided)
+    2. Run BM25 + Vector search for ALL variations
+    3. Fuse results using RRF
+    4. Return top-k results
     """
+    
+    # 1. Query Expansion
+    queries = [question]
+    if llm:
+        queries = generate_multi_queries(llm, question)
+        # print(f"🔍 Extended Queries: {queries}")
+
     ranked_lists: list[list[Document]] = []
-
-    # Vector search with scores (single call — gives us both docs and scores)
     best_vector_score = 0.0
-    try:
-        scored = vectorstore.similarity_search_with_relevance_scores(question, k=k)
-        if scored:
-            best_vector_score = max(score for _, score in scored)
-            ranked_lists.append([doc for doc, _ in scored])
-    except Exception:
-        vec_docs = vectorstore.similarity_search(question, k=k)
-        ranked_lists.append(vec_docs)
 
-    # BM25 search
-    if bm25_retriever is not None:
-        bm25_docs = bm25_retriever.invoke(question)[:k]
-        ranked_lists.append(bm25_docs)
+    for q in queries:
+        # Vector search
+        try:
+            scored = vectorstore.similarity_search_with_relevance_scores(q, k=k)
+            if scored:
+                current_best = max(score for _, score in scored)
+                best_vector_score = max(best_vector_score, current_best)
+                ranked_lists.append([doc for doc, _ in scored])
+        except Exception:
+            vec_docs = vectorstore.similarity_search(q, k=k)
+            ranked_lists.append(vec_docs)
+
+        # BM25 search
+        if bm25_retriever is not None:
+            bm25_docs = bm25_retriever.invoke(q)[:k]
+            ranked_lists.append(bm25_docs)
 
     # RRF fusion
     fused = reciprocal_rank_fusion(ranked_lists)
-    top_docs = fused[:k]
+    top_docs = fused[:k*2] # Get a bit more to filter duplicates/low quality if needed
+
+    # Deduplicate by content to be safe (RRF already does key-based dedup, but let's be sure)
+    unique_docs = []
+    seen_content = set()
+    rrf_scores = {}
+    
+    for i, (doc, score) in enumerate(top_docs):
+        # Use a hash of the content to deduplicate exact text matches
+        content_hash = hash(doc.page_content.strip())
+        if content_hash not in seen_content:
+            seen_content.add(content_hash)
+            unique_docs.append(doc)
+            rrf_scores[len(unique_docs)-1] = score # Map new index to score
+            
+        if len(unique_docs) >= k:
+            break
 
     return RetrievalResult(
-        docs=[doc for doc, _ in top_docs],
-        rrf_scores={i: score for i, (_, score) in enumerate(top_docs)},
+        docs=unique_docs,
+        rrf_scores=rrf_scores,
         best_vector_score=best_vector_score,
     )
