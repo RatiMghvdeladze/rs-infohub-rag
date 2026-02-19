@@ -1,24 +1,33 @@
+"""
+InfoHub AI Agent — Streamlit RAG Application.
+
+Major improvements:
+  - Uses the unified retriever module (RRF + multi-query)
+  - Conversation-aware prompting (last N messages as context)
+  - Upgraded LLM (gemini-2.5-flash)
+  - Better prompt with chain-of-thought reasoning
+  - Single retrieval call per question (no double-fetch)
+  - Improved source display with titles
+"""
+
 import os
 import re
-import json
-from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
-
+from pathlib import Path
 from langchain_community.retrievers import BM25Retriever
+
+from retriever import load_chunks_from_file, retrieve
+
 
 load_dotenv()
 
 CHROMA_PATH = "data/chroma_db"
-CHUNKS_FILE = Path("data/chunks.jsonl")
+CHUNKS_FILE = "data/chunks.jsonl"
 
 st.set_page_config(page_title="InfoHub AI", page_icon="🇬🇪")
 
@@ -26,7 +35,8 @@ st.set_page_config(page_title="InfoHub AI", page_icon="🇬🇪")
 # Defaults
 # -----------------------------
 DEFAULT_K = 5
-DEFAULT_THRESHOLD = 0.55
+DEFAULT_THRESHOLD = 0.45
+MAX_HISTORY_TURNS = 4  # how many past Q&A pairs to include in prompt
 
 SOURCE_FOOTER = (
     "წყარო: საინფორმაციო და მეთოდოლოგიური ჰაბზე განთავსებული დოკუმენტების მიხედვით "
@@ -37,82 +47,96 @@ SOURCE_FOOTER = (
 # Smalltalk filter
 # -----------------------------
 GREETING_PATTERNS = [
-    r"^\s*გამარჯობა\s*!?\s*$",
-    r"^\s*სალამი\s*!?\s*$",
-    r"^\s*ჰეი\s*!?\s*$",
-    r"^\s*დილამშვიდობისა\s*!?\s*$",
-    r"^\s*საღამომშვიდობისა\s*!?\s*$",
-    r"^\s*მადლობა\s*!?\s*$",
-    r"^\s*ok\s*!?\s*$",
-    r"^\s*okay\s*!?\s*$",
-    r"^\s*hello\s*!?\s*$",
-    r"^\s*hi\s*!?\s*$",
+    r"^\s*გამარჯობა[!.\s]*$",
+    r"^\s*გაუმარჯოს[!.\s]*$",
+    r"^\s*სალამი[!.\s]*$",
+    r"^\s*ჰეი[!.\s]*$",
+    r"^\s*დილამშვიდობისა[!.\s]*$",
+    r"^\s*საღამომშვიდობისა[!.\s]*$",
+    r"^\s*მადლობა[!.\s]*$",
+    r"^\s*დიდი\s*მადლობა[!.\s]*$",
+    r"^\s*გმადლობ(თ|ი)?[!.\s]*$",
+    r"^\s*კარგი[!.\s]*$",
+    r"^\s*ok[!.\s]*$",
+    r"^\s*okay[!.\s]*$",
+    r"^\s*hello[!.\s]*$",
+    r"^\s*hi[!.\s]*$",
+    r"^\s*hey[!.\s]*$",
+    r"^\s*thanks[!.\s]*$",
+    r"^\s*thank\s*you[!.\s]*$",
+    r"^\s*როგორ\s*ხარ[!?.\s]*$",
+    r"^\s*რა\s*ხდება[!?.\s]*$",
 ]
 
-def is_smalltalk(query: str) -> bool:
+SMALLTALK_RESPONSES = {
+    "greeting": (
+        "გამარჯობა! 😊\n\n"
+        "დასვით კითხვა საგადასახადო ან საბაჟო ადმინისტრირების თემაზე "
+        "და გიპასუხებთ InfoHub-ის დოკუმენტებზე დაყრდნობით."
+    ),
+    "thanks": (
+        "არაფრის! 😊 თუ სხვა კითხვა გაქვთ, სიამოვნებით გიპასუხებთ."
+    ),
+}
+
+
+def classify_smalltalk(query: str) -> str | None:
+    """Return smalltalk category or None if it's a real question."""
     q = (query or "").strip().lower()
+
+    # Very short input
+    if len(q) <= 4:
+        return "greeting"
+
+    # Only punctuation/symbols
+    if re.fullmatch(r"[\W_]+", q):
+        return "greeting"
+
+    # Check patterns
     for p in GREETING_PATTERNS:
         if re.match(p, q, flags=re.IGNORECASE):
-            return True
-    if len(q) <= 6:
-        return True
-    if re.fullmatch(r"[\W_]+", q or ""):
-        return True
-    return False
+            # Distinguish thanks vs greeting
+            if any(w in q for w in ["მადლობ", "გმადლობ", "thanks", "thank"]):
+                return "thanks"
+            return "greeting"
+
+    return None
+
 
 def format_docs(docs):
     return "\n\n---\n\n".join(d.page_content for d in docs)
 
-def load_chunks_from_file(path: Path) -> list[Document]:
-    docs = []
-    if not path.exists():
-        return docs
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            docs.append(
-                Document(
-                    page_content=obj.get("page_content", "") or "",
-                    metadata=obj.get("metadata", {}) or {},
-                )
+
+def build_conversation_context(messages: list, max_turns: int = MAX_HISTORY_TURNS) -> str:
+    """Extract the last N Q&A turns from session messages for context."""
+    if not messages:
+        return ""
+
+    turns = []
+    i = len(messages) - 1
+    while i >= 0 and len(turns) < max_turns:
+        if i >= 1 and messages[i]["role"] == "assistant" and messages[i - 1]["role"] == "user":
+            turns.append(
+                f"მომხმარებელი: {messages[i-1]['content'][:300]}\n"
+                f"ასისტენტი: {messages[i]['content'][:500]}"
             )
-    return docs
+            i -= 2
+        else:
+            i -= 1
 
-def hybrid_retrieve(query: str, bm25_retriever, vectorstore: Chroma, k: int):
-    """
-    Manual Hybrid:
-    - BM25 top-k
-    - Vector top-k
-    - merge + dedupe
-    """
-    bm25_docs = bm25_retriever.invoke(query) if bm25_retriever else []
-    bm25_docs = bm25_docs[:k]
+    if not turns:
+        return ""
 
-    vector_docs = vectorstore.similarity_search(query, k=k)
+    turns.reverse()
+    return "წინა დიალოგი:\n" + "\n\n".join(turns)
 
-    combined = []
-    seen = set()
 
-    # BM25 first (keyword priority), then vector
-    for d in bm25_docs + vector_docs:
-        src = d.metadata.get("source", "") or ""
-        title = d.metadata.get("title", "") or ""
-        key = (src + "|" + title + "|" + d.page_content[:120]).strip()
-        if key in seen:
-            continue
-        seen.add(key)
-        combined.append(d)
-
-    return combined[:k]
-
+# -----------------------------
+# Load resources (cached)
+# -----------------------------
 @st.cache_resource
-def load_chain(k: int):
+def load_resources():
+    """Load vectorstore, BM25 retriever, and LLM once."""
     if not os.path.exists(CHROMA_PATH):
         return None, None, None, False, 0
 
@@ -120,67 +144,69 @@ def load_chain(k: int):
     vectorstore = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
 
     # BM25 from chunks.jsonl
-    bm25_docs = load_chunks_from_file(CHUNKS_FILE)
+    bm25_docs = load_chunks_from_file(Path(CHUNKS_FILE))
     bm25_retriever = None
     if bm25_docs:
         bm25_retriever = BM25Retriever.from_documents(bm25_docs)
-        bm25_retriever.k = k
+        bm25_retriever.k = 10  # retrieve more, RRF will re-rank
 
     using_hybrid = bm25_retriever is not None
 
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    # Upgraded LLM: gemini-2.5-flash for much better reasoning
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 
-    template = f"""
-You are an assistant for the Revenue Service of Georgia.
-Answer the question based ONLY on the context below.
+    return vectorstore, bm25_retriever, llm, using_hybrid, len(bm25_docs)
 
-Rules:
-1. Answer in Georgian.
-2. If the answer is not in the context, say you don't know.
-3. ALWAYS end the answer with this exact phrase:
+
+def generate_answer(question: str, context: str, conversation_history: str, llm) -> str:
+    """Generate an answer using the LLM with full context."""
+    prompt = f"""შენ ხარ საქართველოს შემოსავლების სამსახურის ინტელექტუალური ასისტენტი.
+პასუხი გასცე მხოლოდ ქვემოთ მოცემული კონტექსტის საფუძველზე.
+
+წესები:
+1. უპასუხე ქართულ ენაზე.
+2. თუ პასუხი კონტექსტში არ არის, თქვი: "ამ კითხვაზე ინფორმაცია ხელმისაწვდომ დოკუმენტებში ვერ მოიძებნა. გთხოვთ, დაუკავშირდით შემოსავლების სამსახურს დეტალური ინფორმაციისთვის."
+3. იყავი ზუსტი და კონკრეტული — მიუთითე კანონის მუხლები, ვადები, განაკვეთები თუ კონტექსტში მოცემულია.
+4. პასუხი დააფორმატე გასაგებად: გამოიყენე ჩამონათვალი ან ნუმერაცია საჭიროებისამებრ.
+5. ყოველთვის დაასრულე პასუხი ზუსტად ამ ფრაზით:
    "{SOURCE_FOOTER}"
 
-Context:
-{{context}}
+{conversation_history}
 
-Question:
-{{question}}
-"""
-    prompt = ChatPromptTemplate.from_template(template)
+კონტექსტი:
+{context}
 
-    chain = (
-        {
-            "context": RunnableLambda(lambda q: format_docs(hybrid_retrieve(q, bm25_retriever, vectorstore, k))),
-            "question": RunnablePassthrough(),
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+კითხვა: {question}"""
 
-    return chain, bm25_retriever, vectorstore, using_hybrid, len(bm25_docs)
+    response = llm.invoke(prompt)
+    return response.content if hasattr(response, "content") else str(response)
+
 
 # -----------------------------
 # UI
 # -----------------------------
 st.title("InfoHub AI Agent 🏛️")
 
-st.sidebar.header("⚙️ პარამეტრები / Debug")
-debug_mode = st.sidebar.checkbox("Debug რეჟიმი", value=True)
+st.sidebar.header("⚙️ პარამეტრები")
+debug_mode = st.sidebar.checkbox("Debug რეჟიმი", value=False)
 k = st.sidebar.slider("Top-K დოკუმენტი (retrieval)", min_value=1, max_value=10, value=DEFAULT_K)
-threshold = st.sidebar.slider("Threshold (წყაროების ჩვენება)", min_value=0.10, max_value=0.95, value=DEFAULT_THRESHOLD, step=0.01)
+threshold = st.sidebar.slider(
+    "Threshold (წყაროების ჩვენება)",
+    min_value=0.10, max_value=0.95, value=DEFAULT_THRESHOLD, step=0.01,
+)
 
-chain, bm25_retriever, vectorstore, using_hybrid, bm25_count = load_chain(k)
+vectorstore, bm25_retriever, llm, using_hybrid, bm25_count = load_resources()
 
-if not chain:
+if not vectorstore:
     st.error("Database not found. Please run `python src/ingest.py` first.")
     st.stop()
 
-st.sidebar.caption(f"Retriever: {'HYBRID (BM25 + Vector)' if using_hybrid else 'Vector-only (BM25 chunks not found)'}")
+retriever_label = "HYBRID (BM25 + Vector + RRF)" if using_hybrid else "Vector-only"
+st.sidebar.caption(f"Retriever: {retriever_label}")
 if using_hybrid:
-    st.sidebar.caption(f"BM25 chunks loaded: {bm25_count}")
+    st.sidebar.caption(f"BM25 chunks loaded: {bm25_count:,}")
 else:
-    st.sidebar.caption("BM25 chunks not found → run `python src/ingest.py` to create data/chunks.jsonl")
+    st.sidebar.caption("BM25 chunks not found → run `python src/ingest.py`")
 
 # Chat state
 if "messages" not in st.session_state:
@@ -194,70 +220,84 @@ if query := st.chat_input("დასვით კითხვა..."):
     st.session_state.messages.append({"role": "user", "content": query})
 
     with st.chat_message("assistant"):
-        # Smalltalk: no retrieval, no sources, no debug
-        if is_smalltalk(query):
-            response = (
-                "გამარჯობა! 😊\n\n"
-                "დასვით კითხვა საგადასახადო ან საბაჟო ადმინისტრირების თემაზე და გიპასუხებთ InfoHub-ის დოკუმენტებზე დაყრდნობით.\n\n"
-                f"{SOURCE_FOOTER}"
-            )
+        # Smalltalk check
+        smalltalk_type = classify_smalltalk(query)
+        if smalltalk_type:
+            response = SMALLTALK_RESPONSES.get(smalltalk_type, SMALLTALK_RESPONSES["greeting"])
             st.write(response)
             st.session_state.messages.append({"role": "assistant", "content": response})
             st.stop()
 
-        # Hybrid docs for sources + debug view
-        hybrid_docs = hybrid_retrieve(query, bm25_retriever, vectorstore, k)
+        # === Single unified retrieval call ===
+        with st.spinner("🔍 ძიება მიმდინარეობს..."):
+            result = retrieve(
+                question=query,
+                vectorstore=vectorstore,
+                bm25_retriever=bm25_retriever,
+                k=k,
+            )
 
-        # Vector scores only for deciding whether sources should be meaningful
-        scored = vectorstore.similarity_search_with_relevance_scores(query, k=k)
-        best_score = max([score for _, score in scored], default=0)
+        # Build conversation context for follow-up awareness
+        conv_history = build_conversation_context(st.session_state.messages[:-1])
 
-        # Answer
-        response = chain.invoke(query)
+        # Generate answer
+        context_text = format_docs(result.docs)
+
+        with st.spinner("💭 პასუხის გენერირება..."):
+            response = generate_answer(query, context_text, conv_history, llm)
+
         st.write(response)
 
-        # -------- Sources (ALWAYS visible as UI section, independent of debug) --------
-        # BUT: links are shown only if best_score >= threshold (as you wanted originally)
-        with st.expander("წყაროს ლინკები", expanded=True):
-            if best_score >= threshold:
-                sources = []
-                for d in hybrid_docs:
-                    src = d.metadata.get("source")
-                    if src and src not in sources:
-                        sources.append(src)
+        # ------------------------------------------------------------------
+        # Sources section
+        # ------------------------------------------------------------------
+        with st.expander("📄 წყაროები", expanded=True):
+            if result.best_vector_score >= threshold and result.docs:
+                sources_shown = []
+                for d in result.docs:
+                    src = d.metadata.get("source", "")
+                    title = d.metadata.get("title", "")
+                    if src and src not in [s[0] for s in sources_shown]:
+                        sources_shown.append((src, title))
 
-                if sources:
-                    for s in sources:
-                        st.write(s)
+                if sources_shown:
+                    for src_url, src_title in sources_shown:
+                        if src_title:
+                            st.markdown(f"• **{src_title}**  \n  {src_url}")
+                        else:
+                            st.write(f"• {src_url}")
                 else:
-                    st.write("ამ შეკითხვაზე შესაბამისი წყაროები ვერ მოიძებნა (Top-K შედეგებში).")
+                    st.write("ამ შეკითხვაზე შესაბამისი წყაროები ვერ მოიძებნა.")
             else:
                 st.write("შესაბამისობა (score) დაბალია, ამიტომ წყაროები არ გამოჩნდა ამ პასუხისთვის.")
 
-        # -------- Debug (ONLY when debug_mode ON) --------
+        # ------------------------------------------------------------------
+        # Debug section
+        # ------------------------------------------------------------------
         if debug_mode:
-            with st.expander("🧪 Debug: retrieval შედეგები", expanded=False):
-                st.write(f"**Vector best_score:** `{best_score:.3f}`")
+            with st.expander("🧪 Debug: Retrieval Details", expanded=False):
+                st.write(f"**Best Vector Score:** `{result.best_vector_score:.3f}`")
                 st.write(f"**Top-K:** `{k}`")
                 st.write(f"**Threshold:** `{threshold:.2f}`")
-                st.write(f"**Retriever:** {'HYBRID' if using_hybrid else 'Vector-only'}")
+                st.write(f"**Retriever:** `{retriever_label}`")
 
-                st.markdown("### Hybrid – Top Documents")
-                for idx, d in enumerate(hybrid_docs, start=1):
-                    title = d.metadata.get("title", "")
-                    doc_id = d.metadata.get("doc_id", "")
-                    uuid = d.metadata.get("uuid", "")
-                    source = d.metadata.get("source", "")
+                st.markdown("### 📑 Top Documents (RRF-ranked)")
+                for idx, doc in enumerate(result.docs):
+                    title = doc.metadata.get("title", "")
+                    doc_id = doc.metadata.get("doc_id", "")
+                    uuid_val = doc.metadata.get("uuid", "")
+                    source = doc.metadata.get("source", "")
+                    rrf_score = result.rrf_scores.get(idx, 0.0)
 
-                    st.markdown(f"**{idx})** {title if title else '(no title)'}")
+                    st.markdown(f"**{idx+1})** {title or '(no title)'} — RRF: `{rrf_score:.4f}`")
                     if doc_id:
                         st.write(f"doc_id: {doc_id}")
-                    if uuid:
-                        st.write(f"uuid: {uuid}")
+                    if uuid_val:
+                        st.write(f"uuid: {uuid_val}")
                     if source:
                         st.write(f"source: {source}")
 
-                    preview = (d.page_content or "").strip()
+                    preview = (doc.page_content or "").strip()
                     if len(preview) > 500:
                         preview = preview[:500] + " …"
                     st.code(preview)

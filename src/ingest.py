@@ -1,3 +1,12 @@
+"""
+Ingestion Pipeline — Parse, chunk, and index documents into ChromaDB + BM25.
+
+Key improvements over the original:
+  - Contextual chunk headers: each chunk includes the document title
+  - Georgian-aware text splitting with better separator hierarchy
+  - Larger chunks (1500 chars, 300 overlap) for denser Georgian text
+"""
+
 import json
 import os
 import shutil
@@ -17,14 +26,30 @@ load_dotenv()
 CHROMA_PATH = "data/chroma_db"
 DATA_FILE_JSONL = Path("data/raw_docs.jsonl")
 DATA_FILE_JSON = Path("data/raw_docs.json")
-CHUNKS_FILE = Path("data/chunks.jsonl")  # <-- Hybrid (BM25) ამისთვის
+CHUNKS_FILE = Path("data/chunks.jsonl")
 
-# Chunking
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+# Chunking — larger chunks keep more context for Georgian text
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 300
 
 # Skip tiny docs
 MIN_CONTENT_LEN = 60
+
+# Georgian-aware separators (ordered from strongest to weakest break)
+SEPARATORS = [
+    "\n\n\n",   # triple newline — strong section break
+    "\n\n",     # paragraph break
+    "\n",       # line break
+    "。",       # period (CJK-style, just in case)
+    ".",        # period
+    "!",        # exclamation
+    "?",        # question mark
+    "—",        # em-dash (common in Georgian)
+    ";",        # semicolon
+    ",",        # comma
+    " ",        # space
+    "",         # character-level fallback
+]
 
 
 def clean_html(html_text: str) -> str:
@@ -35,9 +60,7 @@ def clean_html(html_text: str) -> str:
 
 
 def load_raw_docs() -> list:
-    """
-    კითხულობს JSONL-ს თუ არსებობს, თუ არა — JSON-ს.
-    """
+    """Read JSONL if it exists, otherwise try JSON."""
     if DATA_FILE_JSONL.exists():
         docs = []
         with DATA_FILE_JSONL.open("r", encoding="utf-8") as f:
@@ -61,9 +84,7 @@ def load_raw_docs() -> list:
 
 
 def export_chunks_jsonl(chunks: list[Document], out_path: Path):
-    """
-    BM25Retriever-სთვის ვიწერთ chunk-ებს ფაილად (JSONL).
-    """
+    """Save chunks to JSONL for BM25Retriever."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         for d in chunks:
@@ -112,7 +133,12 @@ def main():
         )
 
         text = clean_html(raw_html)
-        content = f"{title}\n\n{text}".strip()
+
+        # === Contextual header: prepend title so every chunk knows its source ===
+        if title:
+            content = f"[დოკუმენტის სათაური: {title}]\n\n{text}".strip()
+        else:
+            content = text.strip()
 
         if len(content) < MIN_CONTENT_LEN:
             skipped_short += 1
@@ -140,11 +166,15 @@ def main():
     print(f"✅ ვალიდური დოკუმენტები: {len(langchain_docs)} | გამოტოვებული მოკლე: {skipped_short}")
 
     print("✂️ ტექსტის დაჭრა chunks-ებად...")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=SEPARATORS,
+    )
     chunks = splitter.split_documents(langchain_docs)
     print(f"📦 chunks რაოდენობა: {len(chunks)}")
 
-    # Hybrid-ისთვის chunks ფაილში შენახვა
+    # Save chunks for BM25 hybrid search
     export_chunks_jsonl(chunks, CHUNKS_FILE)
 
     embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
@@ -154,12 +184,40 @@ def main():
         shutil.rmtree(CHROMA_PATH)
         print("🧹 ძველი chroma_db წაიშალა")
 
-    print("💾 ჩაწერა ChromaDB-ში...")
-    Chroma.from_documents(
-        documents=chunks,
+    # --- Batched ingestion to avoid Gemini API rate limits ---
+    import time
+
+    BATCH_SIZE = 100
+    total = len(chunks)
+    print(f"💾 ჩაწერა ChromaDB-ში... ({total} chunks, batch size {BATCH_SIZE})")
+
+    # Create the vectorstore with the first batch
+    first_batch = chunks[:BATCH_SIZE]
+    vectorstore = Chroma.from_documents(
+        documents=first_batch,
         embedding=embeddings,
         persist_directory=CHROMA_PATH,
     )
+    print(f"  ✅ {min(BATCH_SIZE, total)}/{total} ({min(BATCH_SIZE, total)*100//total}%)")
+
+    # Add remaining batches
+    for i in range(BATCH_SIZE, total, BATCH_SIZE):
+        batch = chunks[i : i + BATCH_SIZE]
+        try:
+            vectorstore.add_documents(batch)
+        except Exception as e:
+            print(f"  ⚠️ Batch {i//BATCH_SIZE + 1} error: {e}")
+            print("  ⏳ Waiting 30s and retrying...")
+            time.sleep(30)
+            try:
+                vectorstore.add_documents(batch)
+            except Exception as e2:
+                print(f"  ❌ Retry failed: {e2} — skipping batch")
+                continue
+
+        done = min(i + BATCH_SIZE, total)
+        print(f"  ✅ {done}/{total} ({done*100//total}%)")
+        time.sleep(1)  # respect rate limits
 
     print("🎉 დასრულდა! ბაზა შეიქმნა:", CHROMA_PATH)
 

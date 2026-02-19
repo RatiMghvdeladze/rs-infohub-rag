@@ -4,8 +4,10 @@ lxml
 python-dotenv
 streamlit
 chromadb
+rank-bm25
 langchain
 langchain-core
 langchain-community
 langchain-chroma
 langchain-google-genai
+langchain-text-splitters
