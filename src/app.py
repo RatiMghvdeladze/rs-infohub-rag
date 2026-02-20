@@ -226,6 +226,18 @@ else:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Welcome message on first visit
+WELCOME_MESSAGE = (
+    "გამარჯობა! 👋 მე ვარ **InfoHub AI ასისტენტი**.\n\n"
+    "შემიძლია დაგეხმაროთ საგადასახადო და საბაჟო ადმინისტრირებასთან "
+    "დაკავშირებულ კითხვებზე, InfoHub-ის დოკუმენტებზე დაყრდნობით.\n\n"
+    "📝 **დასვით ნებისმიერი კითხვა** ქვემოთ მოცემულ ველში!"
+)
+
+if not st.session_state.messages:
+    with st.chat_message("assistant"):
+        st.write(WELCOME_MESSAGE)
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
